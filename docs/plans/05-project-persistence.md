@@ -49,12 +49,13 @@
   - `music_track`: Optional[str], default `None`
   - `final_output_path`: Optional[str], default `None`
   - `error`: Optional[str], default `None`
-  - `created_at`: datetime, default `datetime.utcnow()`
-  - `updated_at`: datetime, default `datetime.utcnow()`
+  - `active_job_id`: Optional[str], default `None`
+  - `created_at`: datetime, default `datetime.now(timezone.utc)` — use timezone-aware UTC, not deprecated `datetime.utcnow()`
+  - `updated_at`: datetime, default `datetime.now(timezone.utc)`, with `sa_column_kwargs={"onupdate": lambda: datetime.now(timezone.utc)}` so it auto-updates on every ORM write
 
 **`Angle` table** — fields:
   - `id`: str, primary key, default `uuid4().hex`
-  - `project_id`: str (FK to Project)
+  - `project_id`: str, `sa_column=Column(String, ForeignKey("project.id", ondelete="CASCADE"))` — **must include `ondelete="CASCADE"` so DB-level deletes cascade automatically**
   - `order`: int
   - `title`: str
   - `pitch`: str (2-sentence description)
@@ -62,13 +63,13 @@
 
 **`StoryBlock` table** — fields:
   - `id`: str, primary key, default `uuid4().hex`
-  - `project_id`: str (FK to Project)
+  - `project_id`: str, `sa_column=Column(String, ForeignKey("project.id", ondelete="CASCADE"))`
   - `order`: int
   - `content`: str (paragraph text)
 
 **`Scene` table** — fields:
   - `id`: str, primary key, default `uuid4().hex`
-  - `project_id`: str (FK to Project)
+  - `project_id`: str, `sa_column=Column(String, ForeignKey("project.id", ondelete="CASCADE"))`
   - `order`: int
   - `title`: str
   - `dialog`: str
@@ -76,34 +77,40 @@
   - `video_prompt`: str
   - `image_path`: Optional[str], default `None` — path to the Flux/ComfyUI-generated scene image (PNG)
   - `audio_path`: Optional[str], default `None`
-  - `audio_duration_seconds`: Optional[float], default `None` — duration of TTS audio measured via ffprobe after synthesis
+  - `audio_duration_seconds`: Optional[float], default `None`
   - `video_clip_path`: Optional[str], default `None`
   - `thumbnail_path`: Optional[str], default `None`
 
 **Acceptance Criteria:**
 - All 4 table classes import cleanly
 - Each has a string primary key with `uuid4()` default
-- `Scene` and `StoryBlock` and `Angle` all have `project_id` field
+- All child tables (`Angle`, `StoryBlock`, `Scene`) have `project_id` with `ondelete="CASCADE"` in the ForeignKey
 - `Scene` has `image_path` (Optional[str]) and `audio_duration_seconds` (Optional[float]) fields
+- `Project.updated_at` uses timezone-aware UTC, not `datetime.utcnow()`
 - No raw SQL strings in this file
 
 ---
 
-## Task 4: Database Initialization
+## Task 4: Database Initialization — Dual Session Factories
 
 **Actionables:**
 - Create `backend/storage/database.py`
 - Define `DATABASE_URL` using `settings.outputs_dir.parent / "faceless_gen.db"` (one directory up from outputs so the DB sits at project root level)
-- Provide an async `init_db()` function that calls `SQLModel.metadata.create_all(engine)` — creates all tables if they don't exist, is safe to call on every startup
-- Provide `get_session()` as an async context manager yielding a SQLModel `AsyncSession`
-- Export an `engine` instance built from `DATABASE_URL` using `create_async_engine` from `sqlalchemy.ext.asyncio`
-- Call `init_db()` in `backend/main.py` using a FastAPI `lifespan` context handler so it runs on server startup
+- Create **two engines**:
+  - `async_engine`: `create_async_engine("sqlite+aiosqlite:///<path>")` — for FastAPI route handlers
+  - `sync_engine`: `create_engine("sqlite:///<path>")` — for pipeline nodes running in background threads
+- Provide `init_db()` as a **synchronous** function using the sync engine: `SQLModel.metadata.create_all(sync_engine)` — this is correct; `create_all()` is synchronous and requires a sync engine. Do NOT pass an async engine to `create_all()`.
+- Provide `get_async_session()` as an async generator for FastAPI `Depends()`: yields `AsyncSession(async_engine)`
+- Provide `get_sync_session()` as a synchronous context manager: yields `Session(sync_engine)` — for use inside pipeline nodes and background threads
+- Call `init_db()` in `backend/main.py` using a FastAPI `lifespan` context handler (not `@app.on_event` which is deprecated)
+- Enable SQLite WAL mode on the sync engine after creation: `with sync_engine.connect() as conn: conn.execute(text("PRAGMA journal_mode=WAL"))` — reduces contention between the async reader and sync writer threads
 
 **Acceptance Criteria:**
 - Starting the FastAPI server creates `faceless_gen.db` on disk if it doesn't exist
 - Re-starting the server with an existing DB does not raise an error or wipe data
-- `ls` confirms the `.db` file exists after first server start
-- `.db` file is listed in `.gitignore` (add it if missing)
+- `get_async_session()` is usable as `Depends(get_async_session)` in FastAPI routes
+- `get_sync_session()` is usable as `with get_sync_session() as session:` in pipeline nodes
+- `.db` file is listed in `.gitignore`
 
 ---
 
@@ -189,18 +196,21 @@
 
 ---
 
-## Task 7: Migrate In-Memory Job Store to SQLite
+## Task 7: Migrate In-Memory Job Store to SQLite (Sync-Safe)
 
 **Actionables:**
 - The existing `backend/storage/job_store.py` uses an in-memory dict. The generation job lifecycle (pending → running → done/failed) should now also be persisted so jobs survive server restarts.
-- Add a `GenerationJob` SQLModel table to `backend/models/job.py` with fields matching the existing `Job` Pydantic model: `id`, `project_id` (FK to Project, nullable — jobs can exist without a project for the old quick-generate flow), `status`, `user_prompt`, `progress_log` (stored as JSON string), `final_output`, `error`, `created_at`
-- Update `backend/storage/job_store.py` to use async SQLite via the session instead of the in-memory dict. Keep the same public method signatures so existing code does not break.
-- `progress_log` is stored as a JSON-encoded string in SQLite. Serialize on write, deserialize on read.
+- Add a `GenerationJob` SQLModel table to `backend/models/job.py` with fields matching the existing `Job` Pydantic model: `id`, `project_id` (FK to Project, nullable), `status`, `user_prompt`, `progress_log` (stored as JSON string), `final_output`, `error`, `created_at`
+- Update `backend/storage/job_store.py` to use the **synchronous** SQLAlchemy session (`get_sync_session()`) for all writes. The job store is always called from background threads (pipeline, SSE bridge), never from async FastAPI handlers directly.
+- Keep the same public method signatures so existing code does not break
+- `progress_log` is stored as a JSON-encoded string in SQLite. Serialize on write, deserialize on read. Wrap deserialization in a try/except — return `[]` if JSON is malformed rather than raising
+- `append_log`: use `with get_sync_session() as session:` inside a threading lock to prevent concurrent appends from corrupting the JSON string
 
 **Acceptance Criteria:**
 - Existing `pytest backend/tests/test_job_store.py -v` passes after this change (adapt mocks if needed)
 - Restarting the server preserves jobs from the previous session (`GET /api/history` still returns them)
-- `append_log` still works without race conditions (use a database transaction per append)
+- `append_log` uses the sync session correctly — no `asyncio.run()` calls anywhere in this file
+- Malformed `progress_log` JSON returns `[]` without raising
 
 ---
 

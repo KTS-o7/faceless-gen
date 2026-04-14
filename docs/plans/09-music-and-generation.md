@@ -16,9 +16,10 @@
 - Mount `backend/assets/music/` as a static file directory in FastAPI at `/assets/music`
 - Create the default persona directory: `backend/assets/personas/default/`
 - Create `backend/assets/personas/default/personality.md` — must contain at minimum:
-  - `Voice-ID: <elevenlabs_voice_id>` on the first line (parseable by `_load_persona()`)
-  - A narration tone description (e.g. "dry, deadpan, factual — like a nature documentary about humans")
+  - **First line must be exactly:** `Voice-ID: <elevenlabs_voice_id>` — this is parsed programmatically by `_load_persona()`
+  - A narration tone description starting on line 2 (e.g. "Tone: dry, deadpan, factual — like a nature documentary about humans")
   - 2–3 example dialog lines showing the style
+  - **Update `_load_persona()` in `backend/pipeline/editorial.py`** to: (1) parse and strip the `Voice-ID:` first line from the content, (2) return a dict with 3 keys: `{"personality": <remaining content without Voice-ID line>, "character": <character.md content>, "voice_id": <parsed id or None>}`. The `personality` value sent to LLM system prompts must **never** contain the raw `Voice-ID:` line.
 - Create `backend/assets/personas/default/character.md` — must contain:
   - A visual description of the stickman character (e.g. "a simple black line stickman figure with circular head, no facial features except two dot eyes, drawn in 2px stroke weight, always centered in frame")
   - Typical poses or expressions used
@@ -76,21 +77,22 @@
   - This preserves backward compatibility with the old prompt-only flow
 - Update `backend/pipeline/nodes/audio.py`:
   - When `project_id` is set, iterate `state["scenes"]` and generate TTS audio for each scene's `dialog` field individually
-  - Use the persona's `elevenlabs_voice_id` if set in `personality.md` (parse as `Voice-ID: <id>` line in the file); fall back to `settings.elevenlabs_voice_id`
+  - Use the persona's `voice_id` from `state["persona"]["voice_id"]` if set; fall back to `settings.elevenlabs_voice_id`
   - Save each to `outputs/{project_id}/audio_{order:02d}.mp3`
-  - After each synthesis, measure duration via `get_audio_duration()` and update the scene's `audio_duration_seconds` in the SQLite DB via `ProjectRepository.update_scene()`
-  - Update each scene's `audio_path` in the DB after each TTS call — allows partial progress recovery
+  - After each synthesis, measure duration via `get_audio_duration()` and update the scene in the DB
+  - **DB writes from pipeline nodes use `get_sync_session()`** (synchronous SQLAlchemy session from Plan 05 Task 4) — never call async DB methods from inside pipeline nodes
+  - Update each scene's `audio_path` and `audio_duration_seconds` in the DB via `ProjectRepository` using the sync session
   - Still use `state["voiceover_script"]` for the old single-file path when no scenes are present
 - Update `backend/pipeline/nodes/image_gen.py`:
   - When `project_id` is set, use each scene's `image_prompt` (already has `STYLE_CONSTRAINTS` appended from Plan 06)
   - Pass `state["persona"]["character"]` visual description as additional conditioning prefix to ComfyUI
   - Save each image to `outputs/{project_id}/scene_{order:02d}.png`
-  - Update each scene's `image_path` in the DB after each generation
+  - Update each scene's `image_path` in the DB using `get_sync_session()` — **never use async session in pipeline nodes**
 - Update `backend/pipeline/nodes/video.py`:
   - When `scenes` is populated, use each scene's `video_prompt` zipped with the generated `image_paths`
   - Pass the scene's generated image as the I2V first-frame anchor to `LocalWanBackend`
   - Save each clip to `outputs/{project_id}/clip_{order:02d}.mp4`
-  - Update each scene's `video_clip_path` and `thumbnail_path` in the DB after each clip
+  - Update each scene's `video_clip_path` and `thumbnail_path` in the DB using `get_sync_session()`
 - Update `backend/pipeline/nodes/assembly.py`:
   - When `scenes` is populated: for each clip, read the scene's `audio_duration_seconds` from state to drive FFmpeg freeze/trim sync
   - Concatenate duration-synced clips in scene `order`
@@ -113,7 +115,8 @@
 - Add the following endpoint to `backend/api/routes/projects.py`:
 
   `POST /projects/{project_id}/generate`
-  — Validates: project stage is `music_selection` — returns 409 if not (prevents double-trigger)
+  — Validates: project stage is `music_selection` **OR `failed`** — returns 409 only for any other stage (allows retry from `failed` state)
+  — If stage is `failed`: reset `project.error = None` before proceeding
   — Validates: project has at least 2 scenes confirmed — returns 409 if not
   — Updates project stage to `generating`
   — Creates a `GenerationJob` in the DB with `project_id` set
@@ -130,8 +133,10 @@
 **Acceptance Criteria:**
 - `POST /api/projects/{id}/generate` returns within 200ms (non-blocking)
 - Calling it twice on the same project at `generating` stage returns 409
-- Calling it when stage is `scene_editing` (not `music_selection`) returns 409
+- Calling it when stage is `scene_editing` (not `music_selection` or `failed`) returns 409
+- Calling it when stage is `failed` succeeds — stage resets to `generating`, error is cleared
 - Background thread correctly reads scenes from the DB and passes them to the pipeline
+- All DB writes in the background thread use `get_sync_session()` — no async calls
 
 ---
 

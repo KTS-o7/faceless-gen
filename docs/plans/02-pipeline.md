@@ -1,16 +1,20 @@
 # Plan 02 — LangGraph Pipeline
 
-> **Goal:** Build the complete Python pipeline: pydantic settings → LangGraph state → scripting node (bifrost LLM) → audio node (ElevenLabs) → image node (Flux/ComfyUI img2img) → video node (LightX2V I2V) → assembly node (MovieLite + FFmpeg duration sync) → CLI entrypoint. All nodes have unit tests with mocked dependencies.
+> **Goal:** Build the complete Python pipeline: pydantic settings → LangGraph state → scripting node (bifrost LLM) → audio node (ElevenLabs) → image node (Flux/ComfyUI img2img) → video node (Wan 2.2 I2V via diffusers+MPS) → assembly node (MovieLite + FFmpeg duration sync) → CLI entrypoint. All nodes have unit tests with mocked dependencies.
 
-**Assumes:** Plan 01 complete. Venv active. `.env` filled with real keys. `docs/lightx2v-invocation.md` written. ComfyUI installed locally with Flux checkpoint available.
+**Assumes:** Plan 01 complete. Venv active. `.env` filled with real keys. `docs/wan-invocation.md` written. `docs/comfyui-workflow.md` written. ComfyUI server available at `http://127.0.0.1:8188`.
+
+**Architecture Decision — Sync nodes, sync SQLite:**
+All LangGraph nodes are **synchronous**. The pipeline runs in a `threading.Thread` from FastAPI. All database writes from pipeline nodes use a **synchronous SQLAlchemy session** (not aiosqlite) created per-node with `sqlalchemy.orm.Session`. The FastAPI request handlers use async sessions (aiosqlite) for read/query operations. This avoids `RuntimeError: This event loop is already running` from calling async code in a sync thread. Two session factories will exist: `get_sync_session()` for pipeline threads, `get_async_session()` for FastAPI routes.
 
 ---
 
 ## Task 1: Config + Settings
 
 **Actionables:**
+- Add to `pyproject.toml` core dependencies: `torch>=2.1`, `torchvision>=0.16`, `torchaudio>=2.1`, `diffusers>=0.32`, `transformers>=4.40`, `accelerate>=0.30`, `sqlalchemy>=2.0`
 - Create `backend/models/config.py` with a `pydantic-settings` `BaseSettings` subclass called `Settings`
-- Fields to include: `bifrost_base_url`, `bifrost_api_key`, `bifrost_model` (default `glm-5`), `elevenlabs_api_key`, `elevenlabs_voice_id`, `video_backend` (default `local`), `cloud_video_api_key`, `cloud_video_base_url`, `wan_model_path`, `outputs_dir` (Path), `models_dir` (Path), `api_host`, `api_port` (int, default 8000), `comfyui_base_url` (default `http://127.0.0.1:8188`), `personas_dir` (Path, default `backend/assets/personas`), `active_persona` (str, default `default`)
+- Fields to include: `bifrost_base_url`, `bifrost_api_key`, `bifrost_model` (default `gpt-4o-mini`), `elevenlabs_api_key`, `elevenlabs_voice_id`, `video_backend` (default `local`), `cloud_video_api_key`, `cloud_video_base_url`, `wan_model_path`, `outputs_dir` (Path), `models_dir` (Path), `api_host`, `api_port` (int, default 8000), `comfyui_base_url` (default `http://127.0.0.1:8188`), `personas_dir` (Path, default `backend/assets/personas`), `active_persona` (str, default `default`)
 - Set `env_file = ".env"` in the model config
 - Export a module-level singleton `settings = Settings()`
 - Write a unit test in `backend/tests/test_config.py` that imports `settings` and asserts key fields are correctly typed and have expected defaults
@@ -22,6 +26,7 @@
 - `settings.api_port` is `8000`
 - `settings.comfyui_base_url` defaults to `http://127.0.0.1:8188`
 - `settings.active_persona` defaults to `"default"`
+- `settings.bifrost_model` defaults to `"gpt-4o-mini"` (not `"glm-5"` — that model name is not a valid bifrost identifier)
 - Importing `settings` with a missing required field raises a `ValidationError`, not a silent default
 
 ---
@@ -144,13 +149,16 @@
 ## Task 7: Video Backend + Video Node
 
 **Actionables:**
-- Read `docs/lightx2v-invocation.md` (written in Plan 01) to understand the confirmed LightX2V invocation interface before writing any code
+- Read `docs/wan-invocation.md` (written in Plan 01) to understand the confirmed diffusers I2V invocation before writing any code
 - Create `backend/providers/video_backend.py` with:
   - An abstract base class `VideoBackend` with abstract method `generate_clip(prompt: str, first_frame_image_path: str, output_path: str, duration_seconds: int = 5) -> str`
-  - A concrete `LocalWanBackend` that invokes LightX2V via `subprocess.run` in **Image-to-Video (I2V) mode** using the confirmed invocation from `docs/lightx2v-invocation.md`
-  - The `first_frame_image_path` argument must be passed as the I2V anchor frame — LightX2V uses this as frame 0 to ensure character appearance is locked
-  - Run each clip as a subprocess (not in-process) so the model fully unloads from MPS memory between clips
-  - Set a subprocess timeout of 300 seconds per clip
+  - A concrete `LocalWanBackend` implementing `VideoBackend` using `diffusers.WanImageToVideoPipeline`:
+    - Loads the pipeline once as a class-level cached instance (not per-call) using `WanImageToVideoPipeline.from_pretrained(settings.wan_model_path, torch_dtype=torch.float16)`
+    - Calls `.to("mps")` and optionally `.enable_model_cpu_offload()` if 18GB is tight
+    - Passes `first_frame_image_path` loaded as a PIL Image as the `image` argument
+    - Appends `STYLE_CONSTRAINTS` to the prompt before calling the pipeline
+    - Saves the output frames as an MP4 to `output_path` using `imageio`
+    - The `STYLE_CONSTRAINTS` constant must be imported from `backend.pipeline.editorial` — **do not define it again here**
   - A `CloudVideoBackend` stub that raises `NotImplementedError` with a clear message
   - A `get_video_backend() -> VideoBackend` factory that selects based on `settings.video_backend`
 - Create `backend/pipeline/nodes/video.py` with a `video_node(state)` function
@@ -161,13 +169,13 @@
   - Append per-clip progress messages to `state["progress_log"]`
   - On any clip failure: set `state["error"]` and return immediately
   - On success: set `state["video_paths"]` and `state["scene_thumbnails"]`
-- Write unit tests covering: all clips succeed with correct image anchors, empty `image_paths` sets error, first clip failure stops and sets error, upstream error skips node, thumbnails extracted per clip, I2V mode flag is passed in subprocess call (verify via mock)
+- Write unit tests covering: all clips succeed with correct image anchors, empty `image_paths` sets error, first clip failure stops and sets error, upstream error skips node, thumbnails extracted per clip, diffusers pipeline is called with `first_frame_image_path` as PIL Image (verify via mock)
 
 **Acceptance Criteria:**
 - `pytest backend/tests/test_nodes.py::TestVideoNode -v` → 6 tests pass
 - When all clips succeed: `len(state["video_paths"]) == len(state["video_prompts"])` and same for thumbnails
-- `first_frame_image_path` is passed to every `generate_clip` call (verify via mock)
-- LightX2V subprocess is called in I2V mode (verify via mock subprocess args)
+- `first_frame_image_path` is opened as PIL Image and passed to `WanImageToVideoPipeline.__call__` (verify via mock)
+- `STYLE_CONSTRAINTS` is appended to prompt before pipeline call (verify via mock call args)
 - When a clip fails: `state["error"]` is set, subsequent clips are not attempted
 - If upstream `state["error"]` exists: node returns without calling backend
 
@@ -261,10 +269,12 @@
 - [ ] `python -c "from backend.pipeline.graph import compiled_graph"` imports cleanly
 - [ ] `backend/pipeline/graph.py` uses sequential wiring (scripting → audio → image_gen → video → assembly)
 - [ ] Image node uses ComfyUI img2img with seed.png anchor and appends style constraints to every prompt
-- [ ] Video node invokes LightX2V in I2V mode, passing generated scene image as first-frame anchor
+- [ ] Video node uses diffusers `WanImageToVideoPipeline` on MPS — NOT LightX2V subprocess
 - [ ] Assembly node applies FFmpeg freeze/trim per scene to sync video duration to TTS audio duration
 - [ ] Assembly node uses real MovieLite API (`VideoWriter`, `add_clips`, `writer.write()`)
-- [ ] `docs/lightx2v-invocation.md` was consulted and `LocalWanBackend` uses the confirmed invocation
+- [ ] `STYLE_CONSTRAINTS` constant is defined only in `backend/pipeline/editorial.py` and imported everywhere else — not redefined
+- [ ] `docs/wan-invocation.md` was consulted and `LocalWanBackend` uses the confirmed diffusers API
 - [ ] `backend/assets/personas/default/seed.png`, `personality.md`, `character.md` exist
+- [ ] All DB writes from pipeline nodes use synchronous SQLAlchemy session (`get_sync_session()`)
 
 **Next:** `docs/plans/03-backend-api.md`

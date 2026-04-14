@@ -17,7 +17,8 @@
   - `UpdateStoryBlockRequest`: `content` (str, min_length=1)
   - `UpdateSceneRequest`: all Optional — `title`, `dialog`, `image_prompt`, `video_prompt`
   - `ChooseAngleRequest`: `angle_id` (str)
-  - `RegenerateFieldRequest`: `field_name` (str), `story_context` (str, default ""), `source_doc_excerpt` (str, default "")
+  - `RegenerateFieldRequest`: `field_name` (Literal["image_prompt", "video_prompt"]), `story_context` (str, default ""), `source_doc_excerpt` (str, default "")`
+    — Using `Literal` here enforces valid field names at Pydantic schema validation level before any LLM call is made
 - Response schemas to define:
   - `ProjectSummary`: `id`, `name`, `stage`, `target_duration_minutes`, `created_at`, `updated_at`
   - `ProjectDetail`: all `ProjectSummary` fields plus `source_doc`, `aspect_ratio`, `music_track`, `final_output_path`, `error`, plus nested lists: `angles`, `story_blocks`, `scenes`
@@ -80,7 +81,9 @@
 - Add the following endpoints to `backend/api/routes/projects.py`:
 
   `POST /projects/{project_id}/angles/generate`
-  — Calls `generate_angles(project.source_doc, project.target_duration_minutes)` from `backend/pipeline/editorial.py`
+  — This route calls a **synchronous blocking LLM function** (`generate_angles`). To avoid blocking the FastAPI async event loop, wrap the call:
+    `result = await asyncio.get_event_loop().run_in_executor(None, generate_angles, project.source_doc, project.target_duration_minutes)`
+  — Apply this `run_in_executor` pattern to **all routes that call LLM functions** (`generate_angles`, `generate_story`, `generate_scenes`, `regenerate_field`) — each can take 5–30 seconds and must not block other requests
   — Saves the 3 returned angles via `ProjectRepository.set_angles()`
   — Updates project stage to `angle_selection`
   — Returns `list[AngleResponse]`
@@ -108,7 +111,7 @@
 
   `POST /projects/{project_id}/story/generate`
   — Fetches the chosen angle from the DB; returns 409 if no angle is chosen yet
-  — Calls `generate_story(project.source_doc, chosen_angle, project.target_duration_minutes)`
+  — Wraps LLM call in `run_in_executor`: `await asyncio.get_event_loop().run_in_executor(None, generate_story, ...)`
   — Saves returned blocks via `ProjectRepository.set_story_blocks()`
   — Updates project stage to `story_editing`
   — Returns `list[StoryBlockResponse]`
@@ -150,7 +153,7 @@
 
   `POST /projects/{project_id}/scenes/generate`
   — Fetches current story blocks; returns 409 if story has fewer than 2 blocks
-  — Calls `generate_scenes(story_blocks, project.target_duration_minutes)`
+  — Wraps LLM call in `run_in_executor`: `await asyncio.get_event_loop().run_in_executor(None, generate_scenes, ...)`
   — Saves scenes via `ProjectRepository.set_scenes()`
   — Updates project stage to `scene_editing`
   — Returns `list[SceneResponse]`
@@ -169,11 +172,11 @@
   — Returns updated `SceneResponse`
 
   `POST /projects/{project_id}/scenes/{scene_id}/regenerate`
-  — Body: `RegenerateFieldRequest`
-  — Calls `regenerate_field(scene, field_name, story_context, source_doc_excerpt)`
+  — Body: `RegenerateFieldRequest` — `field_name` is `Literal["image_prompt", "video_prompt"]`, validated at schema level
+  — Wraps LLM call in `run_in_executor`: `await asyncio.get_event_loop().run_in_executor(None, regenerate_field, ...)`
   — On success: updates the specified field on the scene in the DB
   — Returns updated `SceneResponse`
-  — 422 if `field_name` is invalid (catch `ValueError`)
+  — 422 if `field_name` fails Pydantic Literal validation (automatic, no manual check needed)
 
   `POST /projects/{project_id}/scenes/confirm`
   — Advances project stage to `music_selection`
@@ -204,7 +207,12 @@
 
 **Actionables:**
 - Create `backend/tests/test_projects_api.py` using FastAPI `TestClient`
-- Use a test database (in-memory SQLite) via a dependency override on `get_session`
+- Use a test database (in-memory SQLite) via a dependency override on `get_async_session`:
+  ```
+  app.dependency_overrides[get_async_session] = override_get_async_session
+  ```
+  Where `override_get_async_session` yields an `AsyncSession` backed by `sqlite+aiosqlite:///:memory:`
+- All LLM functions (`generate_angles`, `generate_story`, `generate_scenes`, `regenerate_field`) must be patched with `unittest.mock.patch` in every test that triggers them — no real API calls in tests
 - Tests to cover:
   - `POST /api/projects` creates project and returns 201
   - `GET /api/projects` returns list
@@ -218,7 +226,7 @@
   - `PATCH /api/projects/{id}/story/reorder` with reversed IDs reverses order
   - `POST /api/projects/{id}/scenes/generate` with mocked `generate_scenes` returns scenes
   - `POST /api/projects/{id}/scenes/{scene_id}/regenerate` with mocked `regenerate_field` updates field
-  - `POST /api/projects/{id}/scenes/{scene_id}/regenerate` with invalid field returns 422
+  - `POST /api/projects/{id}/scenes/{scene_id}/regenerate` with `field_name: "dialog"` returns 422 (Pydantic Literal rejects it)
   - `POST /api/projects/{id}/story/confirm` advances stage to `scene_editing`
   - `POST /api/projects/{id}/scenes/confirm` advances stage to `music_selection`
 

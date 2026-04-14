@@ -90,35 +90,92 @@
 
 ---
 
-## Task 6: LightX2V Setup
+## Task 6: Video Inference Setup — LightX2V + MPS Decision
+
+**CRITICAL FINDING — Read before proceeding:**
+LightX2V (`https://github.com/ModelTC/lightx2v`) is **CUDA-only**. Its platform directory contains: `nvidia.py`, `amd_rocm.py`, `ascend_npu.py`, `intel_xpu.py`, `mthreads_musa.py`, `cambricon_mlu.py` — **there is no Apple MPS platform file**. The README announces NVIDIA, AMD ROCm, Ascend, Intel AIPC support — never Apple Silicon. Running LightX2V on this MacBook M3 Pro will either fail at import or fall back to CPU (extremely slow — hours per clip).
+
+**Decision required before writing any video node code:**
+
+Option A — **Use llama.cpp with the Wan GGUF model directly**
+- The model (`QuantStack/Wan2.2-TI2V-5B-GGUF`, file `Wan2.2-TI2V-5B-Q4_K_S.gguf`) is confirmed on HuggingFace
+- llama.cpp has Metal (MPS) support on Apple Silicon via `CMAKE_ARGS="-DLLAMA_METAL=on"`
+- However, llama.cpp's video generation support is unverified — llama.cpp is primarily for LLMs not diffusion models
+- **Risk: Medium** — llama.cpp may not support the Wan video model architecture
+
+Option B — **Use diffusers + PyTorch MPS backend**
+- Wan 2.1/2.2 models are available in full-precision safetensors format on HuggingFace
+- `diffusers>=0.32` has `WanImageToVideoPipeline` with `torch_dtype=torch.float16` and `device="mps"`
+- PyTorch MPS is confirmed available on M-series chips (`torch.backends.mps.is_available()`)
+- Memory constraint: 18GB unified RAM — 5B model in float16 is ~10GB, leaves 8GB for inference
+- **Risk: Low** — diffusers + MPS is a proven path for Apple Silicon video generation
+
+Option C — **Cloud video API as the local backend** (fall back if both above fail)
+- `VIDEO_BACKEND=cloud` path is already stubbed in the plan
+- Use Replicate, fal.ai, or RunwayML API for video generation during development
+- Switch to local once MPS path is confirmed
+- **Risk: Zero** — works immediately, costs money per clip
+
+**Recommended path: Option B (diffusers + MPS)**
 
 **Actionables:**
-- Clone the LightX2V repo into `external/lightx2v`: `git clone https://github.com/ModelTC/lightx2v.git external/lightx2v`
-- Install LightX2V into the active venv from the cloned directory: `pip install -e external/lightx2v`
-- Read `external/lightx2v/README.md` and `external/lightx2v/scripts/` to understand the actual inference invocation interface (config file vs CLI flags — do not assume)
-- Document the confirmed invocation pattern in a new file: `docs/lightx2v-invocation.md` — record the exact command/config format, required arguments, output path behavior, and supported device flags for Apple Silicon MPS
-- Create `scripts/download_model.sh` that:
-  - Creates `./models/wan2.2-5b-q4/` directory
-  - Uses `huggingface-cli download` to fetch the Wan 2.2 5B Q4_K_S GGUF weight file
+- Do NOT clone LightX2V — it will not run on Apple Silicon
+- Remove `external/lightx2v` from the project structure
+- Install: `pip install torch torchvision torchaudio` (MPS support is built-in since PyTorch 2.0)
+- Install: `pip install diffusers>=0.32 transformers>=4.40 accelerate>=0.30`
+- Create `scripts/verify_mps.py`:
+  - Imports `torch`, asserts `torch.backends.mps.is_available()` is `True`
+  - Creates a small test tensor on MPS device and runs a matmul — confirms MPS compute works
+  - Prints: `MPS available: True, device: mps`
+- Create `scripts/download_model.sh`:
+  - Creates `./models/wan2.2-i2v-5b/` directory
+  - Downloads Wan 2.2 I2V 5B in diffusers format from HuggingFace: `huggingface-cli download Wan-AI/Wan2.2-I2V-5B-480P --local-dir ./models/wan2.2-i2v-5b`
+  - **Note:** This is ~20GB. Only run when ready to test video generation. The rest of the pipeline (audio, image, assembly) can be developed and tested without downloading this model.
   - Prints the expected `WAN_MODEL_PATH` value on completion
-  - Is idempotent (re-running skips already-downloaded files)
-- Make the script executable: `chmod +x scripts/download_model.sh`
-- Run the download: `bash scripts/download_model.sh`
+- Document the confirmed diffusers invocation in `docs/wan-invocation.md`:
+  - Record the exact Python API: `WanImageToVideoPipeline.from_pretrained(...)`, `.to("mps")`, `pipeline(image=..., prompt=..., ...)`
+  - Record expected output format, duration control, resolution
+  - Record memory requirements and any `enable_model_cpu_offload()` flags needed for 18GB
+- Update `.env.example`: change `WAN_MODEL_PATH` comment to reference the diffusers model directory, add `VIDEO_BACKEND=local`
 
 **Acceptance Criteria:**
-- `ls external/lightx2v/` shows the cloned repo
-- `python -c "import lightx2v"` succeeds inside the venv
-- `docs/lightx2v-invocation.md` exists and describes the confirmed inference invocation
-- `ls models/wan2.2-5b-q4/` shows the `.gguf` weight file
-- `WAN_MODEL_PATH` in `.env` points to the correct file path
+- `python scripts/verify_mps.py` prints `MPS available: True`
+- `docs/wan-invocation.md` documents the confirmed diffusers I2V Python API
+- `scripts/download_model.sh` is executable and idempotent
+- **No LightX2V anywhere in the project** — `ls external/` should not contain `lightx2v`
+- `python -c "import diffusers; import torch; print(torch.backends.mps.is_available())"` prints `True`
 
 ---
 
-## Task 7: Commit Everything
+## Task 7: ComfyUI Setup for Image Generation
+
+**Actionables:**
+- Clone ComfyUI into `external/comfyui`: `git clone https://github.com/comfyanonymous/ComfyUI.git external/comfyui`
+- Install ComfyUI dependencies into the venv: `pip install -r external/comfyui/requirements.txt`
+- Download a Flux checkpoint (fp8 variant for memory efficiency on 18GB): `huggingface-cli download black-forest-labs/FLUX.1-dev --include "flux1-dev.safetensors" --local-dir external/comfyui/models/checkpoints/`
+- Download the Flux VAE: `huggingface-cli download black-forest-labs/FLUX.1-dev --include "ae.safetensors" --local-dir external/comfyui/models/vae/`
+- Download the CLIP text encoder: `huggingface-cli download comfyanonymous/flux_text_encoders --local-dir external/comfyui/models/text_encoders/`
+  - **Note:** FLUX.1-dev is ~24GB total. Only download when ready for image generation. The scripting, TTS audio, and assembly nodes can all be developed without it.
+  - Alternative: Use `black-forest-labs/FLUX.1-schnell` (Apache 2.0, faster, 4-step inference) to reduce download size and generation time.
+- Start ComfyUI server to verify: `python external/comfyui/main.py --port 8188 --listen 127.0.0.1`
+- In the ComfyUI UI at `http://127.0.0.1:8188`, build and export an img2img workflow:
+  - Nodes needed: `LoadImage` → `VAEEncode` → `KSampler` (with positive/negative `CLIPTextEncode`) → `VAEDecode` → `SaveImage`
+  - Set denoise strength to `0.65` (preserves seed image structure while applying prompt)
+  - Export the workflow as API JSON: **Workflow menu → Save (API format)** → save to `backend/assets/comfyui_img2img_workflow.json`
+- Document the ComfyUI API payload format in `docs/comfyui-workflow.md`:
+  - Record how to inject `image`, `positive_prompt`, `negative_prompt`, and `seed` into the workflow JSON at runtime
+  - Record the polling endpoint: `GET /history/{prompt_id}` and the output image download endpoint: `GET /view?filename=...`
+
+**Acceptance Criteria:**
+- `curl http://127.0.0.1:8188/system_stats` returns 200 (ComfyUI server running)
+- `backend/assets/comfyui_img2img_workflow.json` exists and is valid JSON
+- `docs/comfyui-workflow.md` documents runtime injection points and polling API
+- `python -c "import folder_paths"` succeeds (ComfyUI importable from venv)
+- A test image can be generated via `POST http://127.0.0.1:8188/prompt` with the workflow JSON
 
 **Actionables:**
 - Stage all non-ignored files: `.gitignore`, `README.md`, `pyproject.toml`, `backend/` scaffold, `.env.example`, `scripts/`, `docs/`, `opencode.json`, `.opencode/`
-- Commit with message: `chore: scaffold repo, venv, folder structure, env config, LightX2V setup`
+- Commit with message: `chore: scaffold repo, venv, folder structure, env config, diffusers+MPS video setup, ComfyUI setup`
 - Push to origin main
 
 **Acceptance Criteria:**
@@ -130,14 +187,18 @@
 
 ## Plan 01 Checklist — Before Moving to Plan 02
 
-- [ ] `gh repo view` → shows `faceless-gen` (private) under KTS-o7
+- [ ] `gh repo view` → shows `faceless-gen` under KTS-o7
 - [ ] `ffmpeg -version` → prints version without error
 - [ ] `.venv/bin/python --version` → `Python 3.11.x`
 - [ ] `python -c "import langgraph; import fastapi; import movielite; print('ok')"` → `ok`
+- [ ] `python scripts/verify_mps.py` → `MPS available: True`
+- [ ] `python -c "import diffusers; import torch; print(torch.backends.mps.is_available())"` → `True`
+- [ ] `curl http://127.0.0.1:8188/system_stats` → 200 (ComfyUI running)
+- [ ] `backend/assets/comfyui_img2img_workflow.json` exists
+- [ ] `docs/wan-invocation.md` documents confirmed diffusers I2V API
+- [ ] `docs/comfyui-workflow.md` documents ComfyUI API payload and polling
 - [ ] `find backend -name "__init__.py" | wc -l` → `9`
 - [ ] `.env` exists with real API keys and is gitignored
-- [ ] `ls models/wan2.2-5b-q4/` → shows the `.gguf` file
-- [ ] `docs/lightx2v-invocation.md` exists with confirmed invocation details
 - [ ] `git log --oneline` → clean commit, no secrets
 
 **Next:** `docs/plans/02-pipeline.md`
