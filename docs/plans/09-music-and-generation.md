@@ -1,24 +1,38 @@
 # Plan 09 — Music Selection + Final Generation
 
-> **Goal:** Add bundled royalty-free music track selection, update the LangGraph generation pipeline to work from an approved project's scenes (not a raw prompt), mix music into the final assembly, and build the generation + result UI as steps 4 and 5 of the wizard.
+> **Goal:** Add bundled royalty-free music track selection, update the LangGraph generation pipeline to work from an approved project's scenes (not a raw prompt), wire the full per-scene pipeline (audio → image → video → assembly with duration sync and music mixing), and build the generation + result UI as steps 4 and 5 of the wizard.
 
-**Assumes:** Plans 01–08 complete. All backend tests pass. Wizard steps 1–3 working end-to-end.
+**Assumes:** Plans 01–08 complete. All backend tests pass. Wizard steps 1–3 working end-to-end. ComfyUI installed locally with Flux checkpoint. Persona files exist at `backend/assets/personas/default/`.
 
 ---
 
-## Task 1: Bundle Royalty-Free Music Tracks
+## Task 1: Bundle Royalty-Free Music Tracks + Persona Files
 
 **Actionables:**
 - Create directory `backend/assets/music/`
-- Source 5–8 royalty-free background music tracks in MP3 format, each 2–3 minutes long (long enough to loop once per video). Suitable sources: pixabay.com/music, freemusicarchive.org, or similar CC0-licensed libraries. Download manually.
-- Name files descriptively and consistently: e.g. `calm_acoustic.mp3`, `upbeat_corporate.mp3`, `cinematic_epic.mp3`, `soft_piano.mp3`, `ambient_tech.mp3`
-- Create `backend/assets/music/tracks.json` — a list of objects each with: `filename` (just the basename), `title` (human-readable), `mood` (one of: calm, upbeat, cinematic, ambient, dramatic), `duration_seconds` (int)
-- Mount `backend/assets/music/` as a static file directory in FastAPI at `/assets/music` so the frontend can stream previews directly
+- Source 5–8 royalty-free background music tracks in MP3 format, each 2–3 minutes long. Suitable sources: pixabay.com/music, freemusicarchive.org, or similar CC0-licensed libraries. Download manually.
+- Name files descriptively: e.g. `calm_acoustic.mp3`, `upbeat_corporate.mp3`, `cinematic_epic.mp3`, `soft_piano.mp3`, `ambient_tech.mp3`
+- Create `backend/assets/music/tracks.json` — a list of objects each with: `filename`, `title`, `mood` (one of: calm, upbeat, cinematic, ambient, dramatic), `duration_seconds` (int)
+- Mount `backend/assets/music/` as a static file directory in FastAPI at `/assets/music`
+- Create the default persona directory: `backend/assets/personas/default/`
+- Create `backend/assets/personas/default/personality.md` — must contain at minimum:
+  - `Voice-ID: <elevenlabs_voice_id>` on the first line (parseable by `_load_persona()`)
+  - A narration tone description (e.g. "dry, deadpan, factual — like a nature documentary about humans")
+  - 2–3 example dialog lines showing the style
+- Create `backend/assets/personas/default/character.md` — must contain:
+  - A visual description of the stickman character (e.g. "a simple black line stickman figure with circular head, no facial features except two dot eyes, drawn in 2px stroke weight, always centered in frame")
+  - Typical poses or expressions used
+- Create `backend/assets/personas/default/seed.png` — a reference image of the stickman character on a white background. This is the img2img anchor for all image generation. Can be drawn in any tool (Keynote, Figma, MS Paint). Must be 512×512 or 1024×1024 PNG.
+- Add `backend/assets/personas/*/seed.png` to `.gitignore` if the file is large — or commit it since it is small and critical
+- Mount `backend/assets/personas/` as a static file directory in FastAPI at `/assets/personas` so the frontend can preview persona assets
 
 **Acceptance Criteria:**
-- `GET /assets/music/calm_acoustic.mp3` returns a 200 response with `audio/mpeg` content-type
-- `GET /api/music/tracks` (added in Task 2) returns a list of all tracks in `tracks.json`
-- All `.mp3` files are gitignored — add `backend/assets/music/*.mp3` to `.gitignore`. Only `tracks.json` is committed.
+- `GET /assets/music/calm_acoustic.mp3` returns 200 with `audio/mpeg`
+- `backend/assets/personas/default/personality.md` exists with `Voice-ID:` line and tone description
+- `backend/assets/personas/default/character.md` exists with stickman visual description
+- `backend/assets/personas/default/seed.png` exists and is a valid PNG
+- All `.mp3` files are gitignored — only `tracks.json` committed
+- `_load_persona()` from Plan 06 can load these files without error
 
 ---
 
@@ -52,28 +66,44 @@
 ## Task 3: Update Generation Pipeline for Project-Based Input
 
 **Actionables:**
-- Update `backend/pipeline/state.py`: add `project_id` (Optional[str]) and `scenes` (list[dict]) fields to `PipelineState`
+- Update `backend/pipeline/state.py`: add `project_id` (Optional[str]), `scenes` (list[dict]), `music_track` (Optional[str]), and `persona` (Optional[dict]) fields to `PipelineState`
+- Add a `load_persona_node(state)` as the first node in the project-based flow:
+  - Calls `_load_persona()` from `backend/pipeline/editorial.py`
+  - Sets `state["persona"]` with the loaded `{"personality": ..., "character": ...}` dict
+  - On `FileNotFoundError`: sets `state["error"]` with a clear message about missing persona files
 - Update `backend/pipeline/graph.py`: the existing `scripting_node` must be bypassed when `project_id` is set and `scenes` is non-empty
-  - Add a router function at the start of the graph: if `scenes` is populated, skip directly to `audio_node`; otherwise run `scripting_node` as before
+  - Add a router function at the start of the graph: if `scenes` is populated, run `load_persona_node` then skip directly to `audio_node`; otherwise run `scripting_node` as before
   - This preserves backward compatibility with the old prompt-only flow
 - Update `backend/pipeline/nodes/audio.py`:
-  - When `project_id` is set, iterate `state["scenes"]` and generate TTS audio for each scene's `dialog` field individually, saving each to `outputs/{project_id}/audio_{order:02d}.mp3`
-  - Update each scene's `audio_path` in the SQLite DB via `ProjectRepository.update_scene()` after each TTS call — this allows partial progress recovery
+  - When `project_id` is set, iterate `state["scenes"]` and generate TTS audio for each scene's `dialog` field individually
+  - Use the persona's `elevenlabs_voice_id` if set in `personality.md` (parse as `Voice-ID: <id>` line in the file); fall back to `settings.elevenlabs_voice_id`
+  - Save each to `outputs/{project_id}/audio_{order:02d}.mp3`
+  - After each synthesis, measure duration via `get_audio_duration()` and update the scene's `audio_duration_seconds` in the SQLite DB via `ProjectRepository.update_scene()`
+  - Update each scene's `audio_path` in the DB after each TTS call — allows partial progress recovery
   - Still use `state["voiceover_script"]` for the old single-file path when no scenes are present
+- Update `backend/pipeline/nodes/image_gen.py`:
+  - When `project_id` is set, use each scene's `image_prompt` (already has `STYLE_CONSTRAINTS` appended from Plan 06)
+  - Pass `state["persona"]["character"]` visual description as additional conditioning prefix to ComfyUI
+  - Save each image to `outputs/{project_id}/scene_{order:02d}.png`
+  - Update each scene's `image_path` in the DB after each generation
 - Update `backend/pipeline/nodes/video.py`:
-  - When `scenes` is populated, use each scene's `video_prompt` instead of `state["video_prompts"]`
+  - When `scenes` is populated, use each scene's `video_prompt` zipped with the generated `image_paths`
+  - Pass the scene's generated image as the I2V first-frame anchor to `LocalWanBackend`
   - Save each clip to `outputs/{project_id}/clip_{order:02d}.mp4`
   - Update each scene's `video_clip_path` and `thumbnail_path` in the DB after each clip
 - Update `backend/pipeline/nodes/assembly.py`:
-  - When `scenes` is populated: concatenate clips in scene `order` — one clip per scene
-  - Mix in music if `state.get("music_track")` is set: use `ffmpeg` subprocess to overlay the music at reduced volume (e.g. -18dB) under the assembled video's audio track. Loop the music track if it is shorter than the video.
+  - When `scenes` is populated: for each clip, read the scene's `audio_duration_seconds` from state to drive FFmpeg freeze/trim sync
+  - Concatenate duration-synced clips in scene `order`
+  - Mix in music if `state.get("music_track")` is set: use `ffmpeg` subprocess to overlay music at -18dB under the assembled video's audio track. Loop the music track if shorter than the video.
   - Save final output to `outputs/{project_id}/final.mp4`
 
 **Acceptance Criteria:**
 - Old single-prompt flow (`python main.py --prompt "..."`) still works — `pytest backend/tests/ -v` passes
 - When `scenes` is provided: `scripting_node` is skipped (verify via unit test with mocked graph)
-- Assembly with `music_track` set produces a file — verify via a test that the ffmpeg command is constructed with the music overlay flag
-- Each scene's `audio_path` and `video_clip_path` in the DB are updated as generation progresses (not only at the end)
+- `load_persona_node` runs before audio when in project mode — `state["persona"]` is set (verify via unit test)
+- Each scene's `audio_path`, `audio_duration_seconds`, `image_path`, `video_clip_path` in the DB are updated as generation progresses (not only at the end)
+- Assembly with `music_track` set produces a file — verify via test that the ffmpeg command includes the music overlay flag
+- Assembly applies per-scene freeze/trim: verify via mock that FFmpeg `tpad` or trim command is called based on mocked duration values
 
 ---
 
@@ -244,19 +274,23 @@
 - [ ] Download link downloads the MP4
 - [ ] Re-opening a completed project shows video player immediately
 - [ ] Old prompt-only flow (`python main.py --prompt`) still works
+- [ ] `backend/assets/personas/default/personality.md`, `character.md`, `seed.png` all exist
+- [ ] Per-scene pipeline runs in order: audio → image (ComfyUI img2img with seed.png) → video (LightX2V I2V with scene image) → assembly (FFmpeg duration sync + music mix)
+- [ ] Each scene's `audio_duration_seconds` is measured and stored in DB
+- [ ] Assembly applies FFmpeg freeze/trim per scene to sync clip length to TTS audio
 
 ---
 
 ## Complete Project Map (All 9 Plans)
 
 ```
-Plan 01 — Repo, venv, FFmpeg, folder scaffold, LightX2V setup
-Plan 02 — LangGraph pipeline: scripting, audio, video, assembly nodes
+Plan 01 — Repo, venv, FFmpeg, ComfyUI setup, folder scaffold, LightX2V setup
+Plan 02 — LangGraph pipeline: scripting, audio, image_gen (ComfyUI I2V), video (LightX2V I2V), assembly (FFmpeg duration sync)
 Plan 03 — FastAPI backend: job store, SSE, history routes
 Plan 04 — React frontend: basic dashboard, form, progress log, history
-Plan 05 — SQLite persistence: project, angle, story block, scene tables
-Plan 06 — LLM editorial nodes: angles, story, scene breakdown, per-field regen
+Plan 05 — SQLite persistence: project, angle, story block, scene tables (with image_path + audio_duration_seconds)
+Plan 06 — LLM editorial nodes: angles, story, scene breakdown, per-field regen (persona injection + style constraints)
 Plan 07 — Project API routes: full CRUD + all editorial endpoints
 Plan 08 — Frontend wizard: angle selection, story editing, scene editing
-Plan 09 — Music selection, project-based generation, generate + result UI
+Plan 09 — Persona files, music selection, project-based generation (per-scene audio→image→video→assembly), generate + result UI
 ```

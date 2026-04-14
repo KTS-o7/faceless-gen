@@ -74,7 +74,9 @@
   - `dialog`: str
   - `image_prompt`: str
   - `video_prompt`: str
+  - `image_path`: Optional[str], default `None` — path to the Flux/ComfyUI-generated scene image (PNG)
   - `audio_path`: Optional[str], default `None`
+  - `audio_duration_seconds`: Optional[float], default `None` — duration of TTS audio measured via ffprobe after synthesis
   - `video_clip_path`: Optional[str], default `None`
   - `thumbnail_path`: Optional[str], default `None`
 
@@ -82,6 +84,7 @@
 - All 4 table classes import cleanly
 - Each has a string primary key with `uuid4()` default
 - `Scene` and `StoryBlock` and `Angle` all have `project_id` field
+- `Scene` has `image_path` (Optional[str]) and `audio_duration_seconds` (Optional[float]) fields
 - No raw SQL strings in this file
 
 ---
@@ -148,7 +151,7 @@
   — Deletes existing scenes for project, inserts new ones
 
   `update_scene(session, project_id, scene_id, **kwargs) -> Scene`
-  — Updates any subset of fields on a single scene
+  — Updates any subset of fields on a single scene, including `image_path`, `audio_path`, `audio_duration_seconds`, `video_clip_path`, `thumbnail_path`
 
   `reorder_scenes(session, project_id, ordered_ids: list[str]) -> list[Scene]`
   — Updates `order` field of each Scene to match position in `ordered_ids`
@@ -161,6 +164,7 @@
 - `delete_project` also removes all child Angle, StoryBlock, and Scene rows (no orphaned rows)
 - `reorder_story_blocks` with ids in reverse order correctly flips the order values
 - `update_project` with unknown `project_id` raises `ValueError`
+- `update_scene` correctly persists `image_path` and `audio_duration_seconds` fields
 
 ---
 
@@ -222,5 +226,7 @@
 - [ ] Re-starting server does not wipe existing data
 - [ ] `pytest backend/tests/ -v` → all tests pass including `test_project_repo.py`
 - [ ] `faceless_gen.db` is gitignored
+- [ ] `Scene` table has `image_path` (Optional[str]) and `audio_duration_seconds` (Optional[float]) columns
+- [ ] `update_scene` persists both new fields correctly
 
 **Next:** `docs/plans/06-editorial-llm-nodes.md`
