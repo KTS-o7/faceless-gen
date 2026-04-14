@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Node / Frontend
+node_modules/
+dist/
+.vite/
+
+# Music assets (source manually, not committed)
+backend/assets/music/*.mp3
+
+# Generated outputs
+outputs/
+*.mp4
+*.wav
+*.mp3
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
