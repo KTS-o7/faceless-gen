@@ -44,10 +44,13 @@ def scripting_node(state: PipelineState) -> dict:
         video_prompts = data["video_prompts"]
         voiceover_script = data["voiceover_script"]
 
+        msg = "scripting_node: script generated successfully"
+        if state.get("progress_queue") is not None:
+            state["progress_queue"].put(msg)
         return {
             "video_prompts": video_prompts,
             "voiceover_script": voiceover_script,
-            "progress_log": ["scripting_node: script generated successfully"],
+            "progress_log": [msg],
         }
 
     except (json.JSONDecodeError, KeyError) as exc:

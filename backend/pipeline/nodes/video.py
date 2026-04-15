@@ -53,12 +53,18 @@ def video_node(state: PipelineState) -> dict:
                 output_path=clip_path,
             )
             video_paths.append(saved_path)
-            progress_entries.append(f"video_node: clip {n:02d} → {saved_path}")
+            clip_msg = f"video_node: clip {n:02d} → {saved_path}"
+            progress_entries.append(clip_msg)
+            if state.get("progress_queue") is not None:
+                state["progress_queue"].put(clip_msg)
 
             # Extract thumbnail
             _extract_thumbnail(saved_path, thumb_path)
             scene_thumbnails.append(thumb_path)
-            progress_entries.append(f"video_node: thumbnail {n:02d} → {thumb_path}")
+            thumb_msg = f"video_node: thumbnail {n:02d} → {thumb_path}"
+            progress_entries.append(thumb_msg)
+            if state.get("progress_queue") is not None:
+                state["progress_queue"].put(thumb_msg)
 
         except Exception as exc:
             return {

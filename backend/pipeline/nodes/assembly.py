@@ -120,7 +120,10 @@ def assembly_node(state: PipelineState) -> dict:
             except Exception:
                 pass
 
+    assembly_msg = f"assembly_node: assembled final video → {output_path}"
+    if state.get("progress_queue") is not None:
+        state["progress_queue"].put(assembly_msg)
     return {
         "final_output": str(Path(output_path).resolve()),
-        "progress_log": [f"assembly_node: assembled final video → {output_path}"],
+        "progress_log": [assembly_msg],
     }
