@@ -6,6 +6,8 @@ import { SettingsView } from './components/SettingsView'
 import { AnglesStep } from './components/wizard/AnglesStep'
 import { StoryStep } from './components/wizard/StoryStep'
 import { ScenesStep } from './components/wizard/ScenesStep'
+import { MusicStep } from './components/wizard/MusicStep'
+import { GenerateStep } from './components/wizard/GenerateStep'
 import { getProject } from './lib/api'
 import type { ProjectDetail } from './types'
 
@@ -54,10 +56,23 @@ export default function App() {
         return <StoryStep project={activeProject} onContinue={advanceStep} />
       case 3:
         return <ScenesStep project={activeProject} onContinue={advanceStep} onProjectUpdate={setActiveProject} />
+      case 4:
+        return <MusicStep project={activeProject} onContinue={advanceStep} />
+      case 5:
+        return (
+          <GenerateStep
+            project={activeProject}
+            onProjectUpdate={setActiveProject}
+            onNewProject={() => {
+              setActiveProject(null)
+              setActiveStep(null)
+            }}
+          />
+        )
       default:
         return (
           <div className="text-zinc-400 text-sm p-4">
-            Step {activeStep} — coming in Plan 09
+            Step {activeStep} — coming soon
           </div>
         )
     }

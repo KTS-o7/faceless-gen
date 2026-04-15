@@ -1,0 +1,7 @@
+[
+  {"filename": "calm_acoustic.mp3", "title": "Calm Acoustic", "mood": "calm", "duration_seconds": 180},
+  {"filename": "upbeat_corporate.mp3", "title": "Upbeat Corporate", "mood": "upbeat", "duration_seconds": 150},
+  {"filename": "cinematic_epic.mp3", "title": "Cinematic Epic", "mood": "cinematic", "duration_seconds": 200},
+  {"filename": "soft_piano.mp3", "title": "Soft Piano", "mood": "ambient", "duration_seconds": 165},
+  {"filename": "ambient_tech.mp3", "title": "Ambient Tech", "mood": "ambient", "duration_seconds": 175}
+]

@@ -21,6 +21,11 @@ class TestInitialState:
             "progress_log",
             "error",
             "progress_queue",
+            # Plan 09 project-based fields
+            "project_id",
+            "scenes",
+            "music_track",
+            "persona",
         }
         assert set(state.keys()) == expected_keys
 

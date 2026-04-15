@@ -4,7 +4,10 @@ All DB operations use the synchronous ProjectRepository wrapped in asyncio.to_th
 to avoid blocking the async event loop. LLM calls also use run_in_executor.
 """
 import asyncio
+import queue as queue_module
 import shutil
+import threading
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -29,13 +32,17 @@ from backend.models.schemas import (
     scene_to_response,
     story_block_to_response,
 )
+from backend.models.job import Job, JobStatus
 from backend.pipeline.editorial import (
     generate_angles,
     generate_scenes,
     generate_story,
     regenerate_field,
 )
+from backend.pipeline.graph import compiled_graph
+from backend.pipeline.state import initial_state
 from backend.storage.database import get_sync_session
+from backend.storage.job_store import job_store
 from backend.storage.project_repo import repo
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -557,3 +564,156 @@ async def confirm_scenes(project_id: str) -> ProjectSummary:
     if result is None:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Project-Based Generation
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{project_id}/generate")
+async def generate_project_video(project_id: str):
+    """Kick off background pipeline for an approved project."""
+    _validate_project_id(project_id)
+
+    def _get_project():
+        with get_sync_session() as session:
+            return repo.get_project(session, project_id)
+
+    project = await asyncio.to_thread(_get_project)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+
+    # Validate stage
+    if project.stage not in ("music_selection", "failed"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot generate from stage '{project.stage}'. "
+                "Must be 'music_selection' or 'failed'."
+            ),
+        )
+
+    def _get_scenes():
+        with get_sync_session() as session:
+            scenes = repo.get_scenes(session, project_id)
+            if len(scenes) < 2:
+                raise ValueError("Project needs at least 2 scenes")
+            return [
+                {
+                    "id": s.id,
+                    "order": s.order,
+                    "title": s.title,
+                    "dialog": s.dialog,
+                    "image_prompt": s.image_prompt,
+                    "video_prompt": s.video_prompt,
+                    "audio_path": s.audio_path,
+                    "audio_duration_seconds": s.audio_duration_seconds,
+                    "image_path": s.image_path,
+                    "video_clip_path": s.video_clip_path,
+                    "thumbnail_path": s.thumbnail_path,
+                }
+                for s in scenes
+            ]
+
+    try:
+        scenes = await asyncio.to_thread(_get_scenes)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    # Create job
+    job_id = uuid.uuid4().hex
+    job = Job(job_id=job_id, user_prompt=f"Project: {project.name}", status=JobStatus.pending)
+    job_store.create(job)
+
+    # Reset error if retrying from failed; set stage to generating
+    def _reset_and_start():
+        with get_sync_session() as session:
+            repo.update_project(
+                session,
+                project_id,
+                stage="generating",
+                error=None,
+                active_job_id=job_id,
+            )
+
+    await asyncio.to_thread(_reset_and_start)
+
+    music_track = project.music_track
+    project_name = project.name
+
+    q: queue_module.Queue = queue_module.Queue()
+
+    def _run_pipeline():
+        # Mark job as running
+        existing = job_store.get(job_id)
+        if existing:
+            job_store.update(Job(**{**existing.model_dump(), "status": JobStatus.running}))
+
+        try:
+            state = initial_state(
+                job_id,
+                f"Project: {project_name}",
+                progress_queue=q,
+                project_id=project_id,
+                scenes=scenes,
+                music_track=music_track,
+            )
+
+            result = compiled_graph.invoke(state)
+
+            if result.get("error"):
+                with get_sync_session() as session:
+                    repo.update_project(
+                        session,
+                        project_id,
+                        stage="failed",
+                        error=result["error"],
+                        active_job_id=None,
+                    )
+                j = job_store.get(job_id)
+                if j:
+                    job_store.update(
+                        Job(**{**j.model_dump(), "status": JobStatus.failed, "error": result["error"]})
+                    )
+            else:
+                with get_sync_session() as session:
+                    repo.update_project(
+                        session,
+                        project_id,
+                        stage="done",
+                        final_output_path=result.get("final_output"),
+                        active_job_id=None,
+                    )
+                j = job_store.get(job_id)
+                if j:
+                    job_store.update(
+                        Job(
+                            **{
+                                **j.model_dump(),
+                                "status": JobStatus.done,
+                                "final_output": result.get("final_output"),
+                                "progress_log": result.get("progress_log", []),
+                            }
+                        )
+                    )
+
+        except Exception as e:
+            with get_sync_session() as session:
+                repo.update_project(
+                    session,
+                    project_id,
+                    stage="failed",
+                    error=str(e),
+                    active_job_id=None,
+                )
+            j = job_store.get(job_id)
+            if j:
+                job_store.update(Job(**{**j.model_dump(), "status": JobStatus.failed, "error": str(e)}))
+        finally:
+            q.put(None)  # sentinel
+
+    thread = threading.Thread(target=_run_pipeline, daemon=True)
+    thread.start()
+
+    return {"job_id": job_id, "project_id": project_id, "status": "pending"}
