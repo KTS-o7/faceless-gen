@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -10,8 +11,17 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from backend.api.routes import generate, history  # noqa: E402
+from backend.api.routes.projects import router as projects_router  # noqa: E402
+from backend.storage.database import init_db  # noqa: E402
 
-app = FastAPI(title="Faceless-Gen", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="Faceless-Gen", version="0.1.0", lifespan=lifespan)
 
 # CORS
 app.add_middleware(
@@ -29,6 +39,7 @@ app.add_middleware(
 # Routers
 app.include_router(generate.router, prefix="/api")
 app.include_router(history.router, prefix="/api")
+app.include_router(projects_router, prefix="/api")
 
 # Static files for outputs directory
 outputs_dir = Path("outputs")
